@@ -1,0 +1,362 @@
+class NanoRobotEnv(gym.Env):
+    metadata = {"render_modes": ["human"], "render_fps": 10}
+
+    def __init__(self, space_size=50, sigma=5, num_obstacles=30,
+                 obstacle_radius=3, num_cancer_cells=10, step_size=1.5):
+        super().__init__()
+        
+#Се превземаат параметрите од погоре како карактеристики на објектот за да може да се користат во понатамошните функции
+        self.space_size = space_size
+        self.sigma = sigma
+        self.obstacle_radius = obstacle_radius
+        self.num_obstacles = num_obstacles
+        self.num_cancer_cells = num_cancer_cells
+        self.step_size = step_size
+        
+# Action и observation space на агентот 
+        self.action_space = spaces.Box(low=-1, high=1, shape=(3,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=0, high=space_size, shape=(4,), dtype=np.float32)
+
+        self.generate_cancer_cells() #ги поставува целните клетки во просторот
+        self.generate_obstacles() # креира пречки кои агентот треба да ги одмине
+        self.reset() # го иницијализира агентот на нова почетна позиција и ја пресметува првата биомаркерска концентрација
+
+# Фунцкија за генерирање позиции на сите канцерогени клетки во просторот
+    def generate_cancer_cells(self):
+        self.cancer_cells = [np.array([random.uniform(0, self.space_size) for _ in range(3)]) # креира 3D координати за секоја клетка и избира случајна точка во опсегот од 0 до space_size за секоја клетка
+                             for _ in range(self.num_cancer_cells)] # ги зачувува сите клетки во листа која агентот ја користи за пресметка на биомаркерска концентрација
+
+# Функција за генерирање позиции на пречки кои агентот учи да ги избегнува
+    def generate_obstacles(self):
+        self.obstacles = [] #листа каде се чуваат сите позиции на пречките
+        for _ in range(self.num_obstacles): # се повторува циклусот онолку пати колку е зададено во параметарот
+            while True:
+                pos = np.array([random.uniform(0, self.space_size) for _ in range(3)]) # се генерира случајна позиција за секоја пречка
+                if all(np.linalg.norm(pos - c) > self.obstacle_radius + 5 for c in self.cancer_cells): # услов за безбедна поставеност
+                    self.obstacles.append(pos) # ако е исполнет условот позицијата се додава во листата
+                    break
+
+# Концентрација на биомаркери за проценка на растојание до канцер клетка
+    def biomarker_concentration(self, pos):
+        dists_sq = [np.sum((pos - c) ** 2) for c in self.cancer_cells] # пресметка на растојание од тековнната позиција на агентот до клетка с (квадрат на секоја координата)
+        return np.exp(-min(dists_sq) / (2 * self.sigma ** 2)) # гаусова функција (bell curve)
+# се формира листа со квадратите на растојанијата до сите канцерогени клетки
+
+
+# Функција за прверка дали агентот удрил во пречка
+    def is_collision(self, pos): # на влез ја имаме позицијата на агентот
+        return any(np.linalg.norm(pos - o) <= self.obstacle_radius for o in self.obstacles)  #проверка на растојанија до сите пречки
+#проверува дали барем една пречка е доволно блиску за да предизвика судир, враќа true ако има, инаку false
+
+# Состојбена функција за секој чекор
+    def get_obs(self):
+        return np.array([*self.pos, self.prev_concentration], dtype=np.float32)  #се пресметува моменталната позиција на агентот и последната пресметана биомаркерска концентрација на таа позиција
+
+   
+    # Gymnasium-compatible функции
+
+# Фунцкија за поставување на почетната состојба на околината
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed) #се повикува основната Gym функција за reset
+        if seed is not None: # ако се внесе seed тогаш секогаш ќе се добиваат исти почетни позиции за тестирање.
+            np.random.seed(seed)
+            random.seed(seed)
+
+        while True:
+            self.pos = np.array([random.uniform(0, self.space_size) for _ in range(3)])   # се бара случајна почетна позиција на агентот 
+            if not self.is_collision(self.pos): # циклусот продолжува додека не се најде позиција које е надвор од сите пречки
+                break
+
+        self.prev_concentration = self.biomarker_concentration(self.pos) # се пресметува почетната биомаркерска концентрација
+        return self.get_obs(), {} # се враќа првото набљуду7вање (позиција + концентрација)
+
+        
+# Функција за пресметка на награда и следни чекор по некоја акција
+    def step(self, action):
+        action = np.clip(action, -1, 1) #проверува дали акцијата е во дадениот опсег
+        new_pos = np.clip(self.pos + action * self.step_size, 0, self.space_size) # се пресметува новата позиција врз основа на акцијата и големината на чекор (step_size)
+
+        reward = 0 # зададени почетни вредности, се менуваат подоцна
+        done = False # зададени почетни вредности, се менуваат подоцна
+
+        if self.is_collision(new_pos):
+            reward = -1 # ако новата позиција се судри со пречка агентот добива казна -1
+        else:
+            concentration = self.biomarker_concentration(new_pos) # инаку се пресметува биомаркерската концентрација на новата позиција
+            done = any(np.linalg.norm(new_pos - c) < 2 for c in self.cancer_cells)
+
+        # Награда/ казна
+            reward = 10 if done else (2 if concentration > self.prev_concentration else -0.2) #   добива награда 10 ако е пронајдена канцер клетка или е премногу блиску до неа
+            # +2 ако концентрацијата се зголемила од претходниот чекор (значи се движи во добра насока)
+            # -0.2 ако концентрацијата се намалила (значи оди во погрешна насока)
+            self.pos = new_pos # се обновува позицијата на агентот
+            self.prev_concentration = concentration # се обновува концентрацијата на новата позиција
+
+        return self.get_obs(), reward, done, False, {} # се враќаат набњудувањата, наградата и дали е завршена епизодата
+
+
+import matplotlib.pyplot as plt
+​
+# Create figure
+fig, ax = plt.subplots(figsize=(8, 6))
+​
+# Flowchart elements
+ax.text(0.5, 0.95, "Start step(action)", ha="center", va="center", fontsize=12,
+        bbox=dict(boxstyle="round", facecolor="lightblue"))
+​
+ax.text(0.5, 0.8, "Clip action [-1,1]\nCompute new_pos", ha="center", va="center", fontsize=11,
+        bbox=dict(boxstyle="round", facecolor="lightgreen"))
+​
+ax.text(0.5, 0.6, "Collision?", ha="center", va="center", fontsize=11,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat"))
+​
+ax.text(0.2, 0.4, "Yes → reward = -1", ha="center", va="center", fontsize=11,
+        bbox=dict(boxstyle="round", facecolor="salmon"))
+​
+ax.text(0.8, 0.4, "No → Compute concentration", ha="center", va="center", fontsize=11,
+        bbox=dict(boxstyle="round", facecolor="lightgreen"))
+​
+ax.text(0.8, 0.25, "Close to cancer cell?", ha="center", va="center", fontsize=11,
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat"))
+​
+ax.text(0.6, 0.1, "Yes → reward = +10, done=True", ha="center", va="center", fontsize=11,
+        bbox=dict(boxstyle="round", facecolor="gold"))
+​
+ax.text(1.0, 0.1, "No → reward = +2 if conc↑\n else -0.2", ha="center", va="center", fontsize=11,
+        bbox=dict(boxstyle="round", facecolor="lightgrey"))
+​
+ax.text(0.5, -0.05, "Update position & concentration\nReturn obs, reward, done", ha="center", va="center", fontsize=11,
+        bbox=dict(boxstyle="round", facecolor="lightblue"))
+​
+# Arrows
+def arrow(start, end):
+    ax.annotate("", xy=end, xytext=start,
+                arrowprops=dict(arrowstyle="->", lw=1.5))
+​
+arrow((0.5, 0.92), (0.5, 0.84))
+arrow((0.5, 0.76), (0.5, 0.64))
+arrow((0.46, 0.58), (0.26, 0.46))
+arrow((0.54, 0.58), (0.74, 0.46))
+arrow((0.8, 0.36), (0.8, 0.28))
+arrow((0.76, 0.2), (0.64, 0.12))
+arrow((0.84, 0.2), (0.96, 0.12))
+arrow((0.8, 0.04), (0.5, -0.02))
+arrow((0.2, 0.32), (0.5, -0.02))
+​
+ax.axis("off")
+plt.show()
+​
+
+import os
+import matplotlib.pyplot as plt
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.results_plotter import load_results, ts2xy
+
+#Креирање папка за логови
+log_dir = "./logs/"
+os.makedirs(log_dir, exist_ok=True)
+
+#Околина со logs
+env = NanoRobotEnv() # повикување на околина за тренирање
+env = Monitor(env, log_dir)
+
+#Тренирање ---
+model = PPO("MlpPolicy", env, verbose=1, ent_coef=0.01) #ent_coef -> е параметар кој покажува колку агентот треба да е склон кон истражување (во случај да е 0 тогаш агентот би бил речиси детерминистички, т.е. секогаш ќе одбира да ја направи најдобрата акција, но ризикува да западне во локален максимум
+model.learn(total_timesteps=200000) #задавање на број на чекори за учење на агентот
+
+# зачувување на модел 
+model.save("ppo_nanoagent_f2")
+print("✅ Model saved as ppo_nanoagent_f2")
+
+#График на просечна награда по епизода
+log_dir = "./logs/"
+results = load_results(log_dir)
+episodes = range(1, len(results['r']) + 1)
+plt.figure(figsize=(10,5))
+plt.plot(episodes, results['r'])
+plt.xlabel("Episode")
+plt.ylabel("Reward")
+plt.title("Average Reward per Episode")
+plt.grid(True)
+plt.show()
+
+
+#График на просечна награда по епизода со просен на 10 епизоди
+
+#Вчитување резултати од тренирање
+results = load_results(log_dir)
+rewards = results['r']
+
+#  Параметар за moving average (просек)
+window = 10
+moving_avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
+
+# график
+plt.figure(figsize=(12,6))
+plt.plot(range(len(rewards)), rewards, color='lightgray', label='Episode Reward')  # оригинални награди
+plt.plot(range(window-1, len(rewards)), moving_avg, color='blue', linewidth=2, label=f'Moving Average (window={window})')  # просек
+plt.xlabel("Episode")
+plt.ylabel("Reward")
+plt.title("Episode Rewards with Moving Average")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+#График за должина на епизода
+
+#  Вчитување резултати од тренирање
+results = load_results(log_dir)
+episode_lengths = results['l']  # 'l' содржи должина на секоја епизода (колку чекори)
+
+# График на должина на епизода -
+plt.figure(figsize=(12,6))
+plt.plot(episode_lengths, color='green', alpha=0.5, label='Episode Length')  # оригинални должини
+
+# Moving average за појасен тренд
+window = 10
+import numpy as np
+moving_avg_len = np.convolve(episode_lengths, np.ones(window)/window, mode='valid')
+plt.plot(range(window-1, len(episode_lengths)), moving_avg_len, color='darkgreen', linewidth=2, label=f'Moving Average (window={window})')
+
+plt.xlabel("Episode")
+plt.ylabel("Episode Length (Steps)")
+plt.title("Episode Length Over Time")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Kреирање на околина за тестирање со истите параметри како и околината за тренирање
+env = NanoRobotEnv(
+    space_size=50,         # големина на просторот
+    sigma=5,            # ширина на биомаркерот
+    num_obstacles=30,      # број на пречки
+    obstacle_radius=3,     # радиус на пречките
+    num_cancer_cells=10,   # број на канцер клетки
+    step_size=1.5         # големина на чекорот на агентот
+)
+
+# Вчитување на зачуваниот модел
+import torch
+torch._dynamo.reset()
+torch._dynamo.disable()
+from stable_baselines3 import PPO
+model = PPO.load("ppo_nanoagent_f2", custom_objects={"observation_space": env.observation_space,
+                                                     "action_space": env.action_space})
+model.set_env(env)
+
+
+
+fig = go.FigureWidget() # се креира интерактивна фигура со динамичко ажурирање на сцената
+
+# се означуваат канцер клетките од зададената околина како точки во црвена боја
+fig.add_scatter3d(x=[c[0] for c in env.cancer_cells],
+                   y=[c[1] for c in env.cancer_cells],
+                   z=[c[2] for c in env.cancer_cells],
+                   mode='markers', marker=dict(size=5, color='red'),
+                   name='Cancer Cells')
+
+# се означуваат препреките од зададената околина како точки во црна боја
+fig.add_scatter3d(x=[o[0] for o in env.obstacles],
+                   y=[o[1] for o in env.obstacles],
+                   z=[o[2] for o in env.obstacles],
+                   mode='markers', marker=dict(size=5, color='black'),
+                   name='Obstacles')
+
+# Поставување на агент
+fig.add_scatter3d(x=[env.pos[0]], y=[env.pos[1]], z=[env.pos[2]], #се зема почетната позиција на агентот од околината, се означува со сина точка и се овозможува исцртување на неговата траекторија со сина линија
+                   mode='markers+lines',
+                   line=dict(color='blue', width=3),
+                   marker=dict(size=3, color='blue'),
+                   name='Agent Trajectory')
+
+# Подесување на 3Д околината
+# се ограничува просторот според големината на околината зададена при тренирање
+fig.update_layout(scene=dict(xaxis=dict(range=[0, env.space_size]),
+                             yaxis=dict(range=[0, env.space_size]),
+                             zaxis=dict(range=[0, env.space_size])))
+display(fig)
+
+
+import threading
+import time
+import numpy as np
+from ipywidgets import Button, HBox, FloatSlider, Label
+from IPython.display import display
+
+#  Контроли 
+start_button = Button(description="Start")
+stop_button = Button(description="Stop")
+speed_slider = FloatSlider(value=0.05, min=0.01, max=0.2, step=0.01, description='Speed (s):')
+status_label = Label(value="Ready")
+
+controls = HBox([start_button, stop_button, speed_slider, status_label])
+display(controls)
+
+
+running = False # дали е активна симулацијата
+trajectory_x, trajectory_y, trajectory_z = [env.pos[0]], [env.pos[1]], [env.pos[2]]
+stagnant_steps = 0
+max_stagnant = 20  # random push ако долго време нема напредок (после 20 чекори)
+
+# Симулација
+def run_simulation():
+    global running, trajectory_x, trajectory_y, trajectory_z, stagnant_steps
+    running = True # се стартува симулацијата
+    obs, _ = env.reset() #се ресетира околината
+    done = False
+    status_label.value = "Running..."
+    
+    trajectory_x = [env.pos[0]]
+    trajectory_y = [env.pos[1]]
+    trajectory_z = [env.pos[2]]
+    stagnant_steps = 0 #почетна вредност за чекори во кои агентот не направил акција
+    prev_concentration = env.prev_concentration
+
+    start_time = time.time()  # почеток на тајмер
+
+    while running and not done:
+        # проверка за 5 секунди
+        if time.time() - start_time > 10:
+            running = False
+            break #симулацијата завршува по 5 секунди
+
+        # стохастички избор на акција
+        action, _ = model.predict(obs, deterministic=False)#на секој чекор моделот предвидува акција
+
+        # random push ако е заглавен
+        if stagnant_steps > max_stagnant:
+            action = np.random.uniform(-1, 1, size=(3,))
+            stagnant_steps = 0
+
+        obs, reward, done, _, _ = env.step(action)
+
+        # проверка дали агентот заглавил во локален максимум
+        if env.prev_concentration <= prev_concentration:
+            stagnant_steps += 1
+        else:
+            stagnant_steps = 0
+        prev_concentration = env.prev_concentration
+
+#се ажурира позицијата на агентот според последната акција
+        trajectory_x.append(env.pos[0])
+        trajectory_y.append(env.pos[1])
+        trajectory_z.append(env.pos[2])
+        
+#се ажурира траекторијата на агентот според последната акција
+        with fig.batch_update():
+            fig.data[2].x = trajectory_x
+            fig.data[2].y = trajectory_y
+            fig.data[2].z = trajectory_z
+
+        time.sleep(speed_slider.value)
+
+    status_label.value = "Stopped" if not running else "Finished"# за крај покажува дали корисникот ја сопрел симулацијата или завршила епизодата
+
+# Stop копче 
+def stop_simulation(_):
+    global running
+    running = False
+
+# повикување на конторлите
+start_button.on_click(lambda x: threading.Thread(target=run_simulation).start())
+stop_button.on_click(stop_simulation)
